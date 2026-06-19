@@ -26,4 +26,4 @@ jobs:
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
-        run: python 8K_filecount_moredetails_automail_1.py
+        run: python 8K_filecount_moredetails_automail_10Qadd.py
