@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 #
 # DATE SELECTION (no manual editing needed):
 #   - default: YESTERDAY's date (today usually isn't fully indexed on EDGAR yet)
-#   - or pass a date explicitly:   python 8K_filecount_moredetails.py 2026-03-23
+#   - or pass a date explicitly:   python script.py 2026-03-23
 #   - DAYS_BACK controls the offset: 1 = yesterday (default), 0 = today,
 #     2 = two days back, etc.
 #
@@ -53,7 +53,7 @@ RECIPIENTS = [
 ]
 
 # Date-stamped output file so each day's report is kept separately
-OUTPUT_FILE = f"8k_item_report_{input_date}.xlsx"
+OUTPUT_FILE = f"filing_report_{input_date}.xlsx"
 
 headers = {
     "User-Agent": "SEC Research your_email@example.com"
@@ -75,7 +75,6 @@ session.headers.update(headers)
 # =========================
 # GLOBAL RATE LIMITER
 # =========================
-# Ensures all threads combined never start more than REQ_PER_SEC requests/sec.
 class RateLimiter:
     def __init__(self, max_per_sec):
         self.min_interval = 1.0 / max_per_sec
@@ -118,18 +117,19 @@ df = pd.read_csv(
 # =========================
 # FILTER TARGET FORM TYPES
 # =========================
-# Match whole form *families* by prefix (the trailing "*" you asked for), so
-# amendments and variants come along automatically:
+# Match whole form *families* by prefix (the trailing "*" means variants are
+# included automatically):
 #   8-K*    -> 8-K, 8-K/A, 8-K12B, ...
 #   10-K*   -> 10-K, 10-K/A, 10-KSB, 10-K405, ...
+#   10-Q*   -> 10-Q, 10-Q/A, 10-QSB, ...          ← NEW
 #   DEF 14* -> DEF 14A, DEF 14C            (note the SPACE)
 #   DEFC14* / DEFM14* / DEFR14* / DEFN14*  (proxy variants, NO space)
 #   20-F*   -> 20-F, 20-F/A
 #   40-F*   -> 40-F, 40-F/A
-# (DEFA14* is intentionally NOT included; add it here if you want it.)
 FORM_PREFIXES = (
     "8-K",
     "10-K",
+    "10-Q",       # NEW: quarterly reports + amendments (10-Q/A, 10-QSB, etc.)
     "DEF 14",
     "DEFC14",
     "DEFM14",
@@ -141,7 +141,7 @@ FORM_PREFIXES = (
 
 form_pattern = r'^(?:' + '|'.join(re.escape(p) for p in FORM_PREFIXES) + r')'
 
-df_8k = df[
+df_filings = df[
     df["Form_Type"].astype(str).str.match(form_pattern, na=False) &
     (df["Date_Filed"] == input_date)
 ].copy()
@@ -149,16 +149,13 @@ df_8k = df[
 # =========================
 # ACCESSION NUMBER
 # =========================
-df_8k["Accession_No"] = df_8k["File_Name"].apply(
+df_filings["Accession_No"] = df_filings["File_Name"].apply(
     lambda x: x.split("/")[-1].replace(".txt","")
 )
 
 # =========================
 # CAPPED DOWNLOAD
 # =========================
-# Stream the response and stop after MAX_BYTES. The item headers and the
-# 5.02 / 4.01 / 5.07 narrative sit near the top of the submission, so there's
-# no need to pull megabytes of exhibits, XBRL, etc.
 def fetch_capped(full_url, max_bytes=MAX_BYTES):
     limiter.wait()
     with session.get(full_url, stream=True, timeout=TIMEOUT) as r:
@@ -181,35 +178,20 @@ def fetch_capped(full_url, max_bytes=MAX_BYTES):
 def detect_items(text):
     """Determine which 8-K items a filing reports.
 
-    Authoritative source: every EDGAR submission begins with an SEC header that
-    declares its items as `ITEM INFORMATION:` lines (the official item titles).
-    This is EDGAR's own metadata, so it does not suffer from the cross-
-    contamination that body-text keyword scanning does -- e.g. a 5.07 annual-
-    meeting filing discusses "election of directors", "named executive officer"
-    compensation (say-on-pay), and "ratification of the appointment of [the]
-    independent registered public accounting firm", which previously tripped the
-    5.02 and 4.01 keyword heuristics even though those items were never reported.
-
-    We read the header titles first, then fall back to the explicit "Item X.YZ"
-    caption in the body. We deliberately use NO loose semantic keywords.
-
-    Returns (i502, i401, i507) as 0/1 flags.
+    Uses EDGAR's own `ITEM INFORMATION:` header metadata first, then falls
+    back to explicit "Item X.YZ" captions in the body. Returns (i502, i401,
+    i507) flags — always 0/0/0 for non-8-K forms (10-K, 10-Q, DEF 14, etc.).
     """
     low = text.lower().replace("\xa0", " ")
 
     # 1) Authoritative: EDGAR's declared item titles in the SEC header.
-    #    Official titles -> the distinctive substring we match:
-    #      5.02 "Departure of Directors or Certain Officers; ..."  -> "departure of directors"
-    #      4.01 "Changes in Registrant's Certifying Accountant"    -> "certifying accountant"
-    #      5.07 "Submission of Matters to a Vote of Security Holders"
     header_titles = " ".join(re.findall(r'item information:\s*(.+)', low))
 
     i502 = 1 if "departure of directors" in header_titles else 0
     i401 = 1 if "certifying accountant" in header_titles else 0
     i507 = 1 if "submission of matters to a vote of security holders" in header_titles else 0
 
-    # 2) Fallback: explicit item-number caption in the body. "item 5.02" etc.
-    #    only appear as a real item caption, so this stays precise.
+    # 2) Fallback: explicit item-number caption in the body.
     if not i502 and re.search(r'item\s*5\.02', low):
         i502 = 1
     if not i401 and re.search(r'item\s*4\.01', low):
@@ -225,17 +207,13 @@ def detect_items(text):
 # =========================
 _progress = {"done": 0}
 _progress_lock = threading.Lock()
-_total = len(df_8k)
+_total = len(df_filings)
 
 
 def process_filing(item):
     idx, file = item
     full_url = "https://www.sec.gov/Archives/" + file
 
-    # Every requested form type is downloaded. detect_items only finds the
-    # 5.02 / 4.01 / 5.07 flags on 8-Ks; for 10-K* / DEF 14* / 20-F* / 40-F* it
-    # simply returns 0/0/0 (those forms don't carry 8-K item numbers), but the
-    # filing is still fetched and the row is still kept for the output.
     try:
         text = fetch_capped(full_url)
         i502, i401, i507 = detect_items(text)
@@ -254,31 +232,28 @@ print(f"Scanning {_total} filings for {input_date} ...")
 
 results = {}
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-    for idx, i502, i401, i507 in ex.map(process_filing, list(df_8k["File_Name"].items())):
+    for idx, i502, i401, i507 in ex.map(process_filing, list(df_filings["File_Name"].items())):
         results[idx] = (i502, i401, i507)
 
-df_8k["Item_5_02"] = [results[i][0] for i in df_8k.index]
-df_8k["Item_4_01"] = [results[i][1] for i in df_8k.index]
-df_8k["Item_5_07"] = [results[i][2] for i in df_8k.index]
+df_filings["Item_5_02"] = [results[i][0] for i in df_filings.index]
+df_filings["Item_4_01"] = [results[i][1] for i in df_filings.index]
+df_filings["Item_5_07"] = [results[i][2] for i in df_filings.index]
 
 # =========================
 # FILTER RELEVANT FILINGS
 # =========================
-# Item flags apply only to 8-Ks, so:
-#   - 8-K rows are kept ONLY when an item (5.02/4.01/5.07) is flagged
-#     (this preserves the original behaviour), and
-#   - every other requested form type (10-K*, DEF 14*, 20-F*, 40-F*, proxies)
-#     is listed regardless, since there is no item flag to gate on.
-# If you instead want ONLY item-flagged 8-Ks in the output (ignoring the new
-# forms), replace the mask below with just `has_flag`.
-is_8k = df_8k["Form_Type"].str.startswith("8-K")
+# Item flags apply only to 8-Ks:
+#   - 8-K rows kept ONLY when an item (5.02/4.01/5.07) is flagged
+#   - All other form types (10-K*, 10-Q*, DEF 14*, 20-F*, 40-F*, proxies)
+#     are listed in full — no item gate.
+is_8k = df_filings["Form_Type"].str.startswith("8-K")
 has_flag = (
-    (df_8k["Item_5_02"] == 1) |
-    (df_8k["Item_4_01"] == 1) |
-    (df_8k["Item_5_07"] == 1)
+    (df_filings["Item_5_02"] == 1) |
+    (df_filings["Item_4_01"] == 1) |
+    (df_filings["Item_5_07"] == 1)
 )
 
-filtered_df = df_8k[(is_8k & has_flag) | (~is_8k)].copy()
+filtered_df = df_filings[(is_8k & has_flag) | (~is_8k)].copy()
 
 # =========================
 # GET INDUSTRY (SIC) — DEDUPED + THREADED
@@ -294,7 +269,6 @@ def get_industry(cik):
         return "Unknown"
 
 
-# Only look up each CIK once, even if it filed multiple matching 8-Ks.
 unique_ciks = filtered_df["CIK"].unique()
 print(f"Fetching industry for {len(unique_ciks)} unique companies ...")
 
@@ -346,8 +320,6 @@ print(f"Report Generated: {OUTPUT_FILE}")
 # EMAIL THE REPORT
 # =========================
 def send_report(attachment_path, recipients, report_date, n_total, n_matched):
-    """Email the xlsx report. Credentials come from environment variables;
-    nothing sensitive is stored in this file."""
     sender = os.environ.get("SENDER_EMAIL")
     password = os.environ.get("SENDER_APP_PASSWORD")
 
@@ -360,21 +332,22 @@ def send_report(attachment_path, recipients, report_date, n_total, n_matched):
     n401 = int(details["Item_4_01"].sum()) if len(details) else 0
     n507 = int(details["Item_5_07"].sum()) if len(details) else 0
 
-    # Per-family counts (prefix match) across the filings in the report
+    # Per-family counts across filings in the report
     if len(details):
         ft = details["Form_Type"].astype(str)
-        n_8k   = int(ft.str.startswith("8-K").sum())
-        n_10k  = int(ft.str.startswith("10-K").sum())
-        n_20f  = int(ft.str.startswith("20-F").sum())
-        n_40f  = int(ft.str.startswith("40-F").sum())
-        n_def  = int(ft.str.startswith("DEF").sum())
+        n_8k  = int(ft.str.startswith("8-K").sum())
+        n_10k = int(ft.str.startswith("10-K").sum())
+        n_10q = int(ft.str.startswith("10-Q").sum())   # NEW
+        n_20f = int(ft.str.startswith("20-F").sum())
+        n_40f = int(ft.str.startswith("40-F").sum())
+        n_def = int(ft.str.startswith("DEF").sum())
     else:
-        n_8k = n_10k = n_20f = n_40f = n_def = 0
+        n_8k = n_10k = n_10q = n_20f = n_40f = n_def = 0
 
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
-    msg["Subject"] = f"8-K Item Report ({report_date})"
+    msg["Subject"] = f"Daily Filing Report ({report_date})"
     msg.set_content(
         f"Automated filing report for {report_date}.\n\n"
         f"Filings scanned   : {n_total}\n"
@@ -382,6 +355,7 @@ def send_report(attachment_path, recipients, report_date, n_total, n_matched):
         f"By form type:\n"
         f"  8-K*   : {n_8k}\n"
         f"  10-K*  : {n_10k}\n"
+        f"  10-Q*  : {n_10q}\n"
         f"  20-F*  : {n_20f}\n"
         f"  40-F*  : {n_40f}\n"
         f"  DEF*   : {n_def}\n\n"
@@ -413,6 +387,6 @@ send_report(
     OUTPUT_FILE,
     RECIPIENTS,
     input_date,
-    n_total=len(df_8k),
+    n_total=len(df_filings),
     n_matched=len(filtered_df),
 )
