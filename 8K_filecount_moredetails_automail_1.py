@@ -100,28 +100,65 @@ dt = datetime.strptime(input_date, "%Y-%m-%d")
 year = dt.year
 quarter = (dt.month - 1) // 3 + 1
 
-url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
 
-response = session.get(url, timeout=TIMEOUT)
-content = response.text
+def _parse_idx(text):
+    """Parse a pipe-delimited EDGAR master.idx into a clean DataFrame."""
+    lines = text.split("\n")
+    data_lines = [l for l in lines if l.count("|") >= 4]
+    df_raw = pd.read_csv(
+        StringIO("\n".join(data_lines)),
+        sep="|",
+        names=["CIK", "Company", "Form_Type", "Date_Filed", "File_Name"],
+        dtype=str,
+    )
+    for col in ["CIK", "Company", "Form_Type", "Date_Filed", "File_Name"]:
+        df_raw[col] = df_raw[col].astype(str).str.strip()
+    return df_raw
 
-# Skip header lines robustly — find the first line that looks like a data row
-# (contains at least 4 pipes) rather than assuming a fixed line count.
-lines = content.split("\n")
-data_lines = [l for l in lines if l.count("|") >= 4]
-data = "\n".join(data_lines)
 
-df = pd.read_csv(
-    StringIO(data),
-    sep="|",
-    names=["CIK","Company","Form_Type","Date_Filed","File_Name"],
-    dtype=str,          # keep everything as string; avoids CIK being parsed as int
+# ------------------------------------------------------------------
+# DATA SOURCE: prefer the DAILY index for the exact date — it is
+# complete for that day even when the quarterly master.idx hasn't
+# been updated yet (late-day filings miss the nightly rebuild).
+# Fall back to the quarterly master.idx if the daily file is absent.
+# ------------------------------------------------------------------
+date_nodash = input_date.replace("-", "")
+daily_url = (
+    f"https://www.sec.gov/Archives/edgar/daily-index/"
+    f"{year}/QTR{quarter}/master{date_nodash}.idx"
+)
+quarterly_url = (
+    f"https://www.sec.gov/Archives/edgar/full-index/"
+    f"{year}/QTR{quarter}/master.idx"
 )
 
-# Strip whitespace from all string columns — EDGAR master.idx often has
-# trailing spaces in Form_Type and Date_Filed which break exact matches.
-for col in ["Form_Type", "Date_Filed", "File_Name", "Company"]:
-    df[col] = df[col].astype(str).str.strip()
+daily_resp = session.get(daily_url, timeout=TIMEOUT)
+if daily_resp.status_code == 200 and "|" in daily_resp.text:
+    df_daily = _parse_idx(daily_resp.text)
+    # Daily index already covers only input_date, but filter just in case
+    df_daily = df_daily[df_daily["Date_Filed"] == input_date]
+    print(f"✓ Daily index loaded  → {len(df_daily)} filings for {input_date}")
+
+    # Also pull the quarterly master for any form types it may have that the
+    # daily index omits (rare, but keeps coverage complete)
+    quarterly_resp = session.get(quarterly_url, timeout=TIMEOUT)
+    df_quarterly = _parse_idx(quarterly_resp.text)
+    df_quarterly = df_quarterly[df_quarterly["Date_Filed"] == input_date]
+    print(f"✓ Quarterly idx loaded → {len(df_quarterly)} filings for {input_date}")
+
+    # Merge: union of both sources, deduplicated by File_Name
+    df = (
+        pd.concat([df_daily, df_quarterly], ignore_index=True)
+        .drop_duplicates(subset=["File_Name"])
+        .reset_index(drop=True)
+    )
+    print(f"✓ Combined total       → {len(df)} unique filings")
+else:
+    print(f"Daily index not available for {input_date}, using quarterly master.idx")
+    quarterly_resp = session.get(quarterly_url, timeout=TIMEOUT)
+    df = _parse_idx(quarterly_resp.text)
+    df = df[df["Date_Filed"] == input_date].reset_index(drop=True)
+    print(f"✓ Quarterly idx loaded → {len(df)} filings for {input_date}")
 
 # =========================
 # FILTER TARGET FORM TYPES
@@ -156,9 +193,8 @@ def _matches_prefix(form_type):
     return any(form_type.startswith(p) for p in FORM_PREFIXES)
 
 mask_form = df["Form_Type"].apply(_matches_prefix)
-mask_date = df["Date_Filed"] == input_date
 
-df_filings = df[mask_form & mask_date].copy()
+df_filings = df[mask_form].copy()   # date already filtered when df was built
 
 # Debug: show exactly what was found so you can verify in the console
 print(f"\nFilings found for {input_date}:")
