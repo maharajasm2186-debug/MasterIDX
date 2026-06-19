@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 #
 # DATE SELECTION (no manual editing needed):
 #   - default: YESTERDAY's date (today usually isn't fully indexed on EDGAR yet)
-#   - or pass a date explicitly:   python script.py 2026-03-23
+#   - or pass a date explicitly:   python 8K_filecount_moredetails_automail_1.py 2026-03-23
 #   - DAYS_BACK controls the offset: 1 = yesterday (default), 0 = today,
 #     2 = two days back, etc.
 #
@@ -105,23 +105,34 @@ url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master
 response = session.get(url, timeout=TIMEOUT)
 content = response.text
 
-# Remove header
-data = "\n".join(content.split("\n")[11:])
+# Skip header lines robustly — find the first line that looks like a data row
+# (contains at least 4 pipes) rather than assuming a fixed line count.
+lines = content.split("\n")
+data_lines = [l for l in lines if l.count("|") >= 4]
+data = "\n".join(data_lines)
 
 df = pd.read_csv(
     StringIO(data),
     sep="|",
-    names=["CIK","Company","Form_Type","Date_Filed","File_Name"]
+    names=["CIK","Company","Form_Type","Date_Filed","File_Name"],
+    dtype=str,          # keep everything as string; avoids CIK being parsed as int
 )
+
+# Strip whitespace from all string columns — EDGAR master.idx often has
+# trailing spaces in Form_Type and Date_Filed which break exact matches.
+for col in ["Form_Type", "Date_Filed", "File_Name", "Company"]:
+    df[col] = df[col].astype(str).str.strip()
 
 # =========================
 # FILTER TARGET FORM TYPES
 # =========================
-# Match whole form *families* by prefix (the trailing "*" means variants are
-# included automatically):
+# Match whole form *families* by prefix so amendments/variants are
+# included automatically:
 #   8-K*    -> 8-K, 8-K/A, 8-K12B, ...
 #   10-K*   -> 10-K, 10-K/A, 10-KSB, 10-K405, ...
-#   10-Q*   -> 10-Q, 10-Q/A, 10-QSB, ...          ← NEW
+#   10-Q*   -> 10-Q, 10-Q/A, 10-QSB, ...
+#               NOTE: 10-Q filings concentrate in Apr-May (Q1), Jul-Aug (Q2),
+#               Oct-Nov (Q3). Counts will be low or zero on off-season days.
 #   DEF 14* -> DEF 14A, DEF 14C            (note the SPACE)
 #   DEFC14* / DEFM14* / DEFR14* / DEFN14*  (proxy variants, NO space)
 #   20-F*   -> 20-F, 20-F/A
@@ -129,7 +140,7 @@ df = pd.read_csv(
 FORM_PREFIXES = (
     "8-K",
     "10-K",
-    "10-Q",       # NEW: quarterly reports + amendments (10-Q/A, 10-QSB, etc.)
+    "10-Q",       # quarterly reports + amendments (10-Q/A, 10-QSB, etc.)
     "DEF 14",
     "DEFC14",
     "DEFM14",
@@ -139,12 +150,20 @@ FORM_PREFIXES = (
     "40-F",
 )
 
-form_pattern = r'^(?:' + '|'.join(re.escape(p) for p in FORM_PREFIXES) + r')'
+# Use startswith (not regex) — simpler, immune to whitespace edge cases,
+# and works identically across all pandas versions.
+def _matches_prefix(form_type):
+    return any(form_type.startswith(p) for p in FORM_PREFIXES)
 
-df_filings = df[
-    df["Form_Type"].astype(str).str.match(form_pattern, na=False) &
-    (df["Date_Filed"] == input_date)
-].copy()
+mask_form = df["Form_Type"].apply(_matches_prefix)
+mask_date = df["Date_Filed"] == input_date
+
+df_filings = df[mask_form & mask_date].copy()
+
+# Debug: show exactly what was found so you can verify in the console
+print(f"\nFilings found for {input_date}:")
+print(df_filings["Form_Type"].value_counts().to_string())
+print(f"Total: {len(df_filings)}\n")
 
 # =========================
 # ACCESSION NUMBER
@@ -156,6 +175,9 @@ df_filings["Accession_No"] = df_filings["File_Name"].apply(
 # =========================
 # CAPPED DOWNLOAD
 # =========================
+# Stream the response and stop after MAX_BYTES. The item headers and the
+# 5.02 / 4.01 / 5.07 narrative sit near the top of the submission, so there's
+# no need to pull megabytes of exhibits, XBRL, etc.
 def fetch_capped(full_url, max_bytes=MAX_BYTES):
     limiter.wait()
     with session.get(full_url, stream=True, timeout=TIMEOUT) as r:
@@ -178,9 +200,11 @@ def fetch_capped(full_url, max_bytes=MAX_BYTES):
 def detect_items(text):
     """Determine which 8-K items a filing reports.
 
-    Uses EDGAR's own `ITEM INFORMATION:` header metadata first, then falls
-    back to explicit "Item X.YZ" captions in the body. Returns (i502, i401,
-    i507) flags — always 0/0/0 for non-8-K forms (10-K, 10-Q, DEF 14, etc.).
+    Uses EDGAR's own `ITEM INFORMATION:` header metadata first (authoritative),
+    then falls back to explicit "Item X.YZ" captions in the body.
+    Returns (i502, i401, i507) as 0/1 flags.
+    Always returns 0/0/0 for non-8-K forms (10-K, 10-Q, DEF 14, etc.) since
+    those forms do not carry 8-K item numbers.
     """
     low = text.lower().replace("\xa0", " ")
 
@@ -214,6 +238,8 @@ def process_filing(item):
     idx, file = item
     full_url = "https://www.sec.gov/Archives/" + file
 
+    # Item detection applies only to 8-Ks; all other form types return 0/0/0
+    # but the filing row is still kept in the output.
     try:
         text = fetch_capped(full_url)
         i502, i401, i507 = detect_items(text)
@@ -245,7 +271,7 @@ df_filings["Item_5_07"] = [results[i][2] for i in df_filings.index]
 # Item flags apply only to 8-Ks:
 #   - 8-K rows kept ONLY when an item (5.02/4.01/5.07) is flagged
 #   - All other form types (10-K*, 10-Q*, DEF 14*, 20-F*, 40-F*, proxies)
-#     are listed in full — no item gate.
+#     are listed in full — no item gate applied.
 is_8k = df_filings["Form_Type"].str.startswith("8-K")
 has_flag = (
     (df_filings["Item_5_02"] == 1) |
@@ -320,6 +346,7 @@ print(f"Report Generated: {OUTPUT_FILE}")
 # EMAIL THE REPORT
 # =========================
 def send_report(attachment_path, recipients, report_date, n_total, n_matched):
+    """Email the xlsx report. Credentials come from environment variables."""
     sender = os.environ.get("SENDER_EMAIL")
     password = os.environ.get("SENDER_APP_PASSWORD")
 
@@ -332,17 +359,24 @@ def send_report(attachment_path, recipients, report_date, n_total, n_matched):
     n401 = int(details["Item_4_01"].sum()) if len(details) else 0
     n507 = int(details["Item_5_07"].sum()) if len(details) else 0
 
-    # Per-family counts across filings in the report
-    if len(details):
-        ft = details["Form_Type"].astype(str)
-        n_8k  = int(ft.str.startswith("8-K").sum())
-        n_10k = int(ft.str.startswith("10-K").sum())
-        n_10q = int(ft.str.startswith("10-Q").sum())   # NEW
-        n_20f = int(ft.str.startswith("20-F").sum())
-        n_40f = int(ft.str.startswith("40-F").sum())
-        n_def = int(ft.str.startswith("DEF").sum())
-    else:
-        n_8k = n_10k = n_10q = n_20f = n_40f = n_def = 0
+    # Per-family counts — computed from ALL filings scanned (df_filings),
+    # not just the filtered subset, so you always see the full day's picture.
+    ft_all = df_filings["Form_Type"].astype(str)
+    n_8k_all  = int(ft_all.str.startswith("8-K").sum())
+    n_10k_all = int(ft_all.str.startswith("10-K").sum())
+    n_10q_all = int(ft_all.str.startswith("10-Q").sum())
+    n_20f_all = int(ft_all.str.startswith("20-F").sum())
+    n_40f_all = int(ft_all.str.startswith("40-F").sum())
+    n_def_all = int(ft_all.str.startswith("DEF").sum())
+
+    # In-report counts (after filtering)
+    ft_rep = details["Form_Type"].astype(str) if len(details) else pd.Series([], dtype=str)
+    n_8k_rep  = int(ft_rep.str.startswith("8-K").sum())
+    n_10k_rep = int(ft_rep.str.startswith("10-K").sum())
+    n_10q_rep = int(ft_rep.str.startswith("10-Q").sum())
+    n_20f_rep = int(ft_rep.str.startswith("20-F").sum())
+    n_40f_rep = int(ft_rep.str.startswith("40-F").sum())
+    n_def_rep = int(ft_rep.str.startswith("DEF").sum())
 
     msg = EmailMessage()
     msg["From"] = sender
@@ -352,13 +386,15 @@ def send_report(attachment_path, recipients, report_date, n_total, n_matched):
         f"Automated filing report for {report_date}.\n\n"
         f"Filings scanned   : {n_total}\n"
         f"Filings in report : {n_matched}\n\n"
-        f"By form type:\n"
-        f"  8-K*   : {n_8k}\n"
-        f"  10-K*  : {n_10k}\n"
-        f"  10-Q*  : {n_10q}\n"
-        f"  20-F*  : {n_20f}\n"
-        f"  40-F*  : {n_40f}\n"
-        f"  DEF*   : {n_def}\n\n"
+        f"By form type (scanned → in report):\n"
+        f"  8-K*   : {n_8k_all:>4}  →  {n_8k_rep}  (item-flagged only)\n"
+        f"  10-K*  : {n_10k_all:>4}  →  {n_10k_rep}\n"
+        f"  10-Q*  : {n_10q_all:>4}  →  {n_10q_rep}\n"
+        f"  20-F*  : {n_20f_all:>4}  →  {n_20f_rep}\n"
+        f"  40-F*  : {n_40f_all:>4}  →  {n_40f_rep}\n"
+        f"  DEF*   : {n_def_all:>4}  →  {n_def_rep}\n\n"
+        f"Note: 10-Q filings peak in Apr-May (Q1), Jul-Aug (Q2), Oct-Nov (Q3).\n"
+        f"      A count of 0 on off-season days is expected.\n\n"
         f"8-K items flagged:\n"
         f"  Item 5.02 : {n502}\n"
         f"  Item 4.01 : {n401}\n"
