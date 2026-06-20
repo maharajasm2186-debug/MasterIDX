@@ -10,6 +10,7 @@ import time
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import holidays as us_holidays
 
 # =============================================================================
 # DAILY AUTOMATION + EMAIL
@@ -43,7 +44,7 @@ else:
     input_date = (date.today() - timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
 
 # Validate format early so a bad argument fails clearly
-datetime.strptime(input_date, "%Y-%m-%d")
+dt = datetime.strptime(input_date, "%Y-%m-%d")
 
 # Recipients for the daily report
 RECIPIENTS = [
@@ -51,6 +52,71 @@ RECIPIENTS = [
     "santhakumarcu@gmail.com",
     "maharajasm2186@gmail.com",
 ]
+
+# =============================================================================
+# WEEKEND / SEC HOLIDAY GUARD
+# =============================================================================
+# The SEC observes all US federal holidays. On those days EDGAR publishes no
+# filings, so we skip the report and instead send a short notification email.
+# =============================================================================
+
+def send_skip_notification(report_date, reason):
+    """Email recipients explaining why no report is being generated today."""
+    sender = os.environ.get("SENDER_EMAIL")
+    password = os.environ.get("SENDER_APP_PASSWORD")
+
+    if not sender or not password:
+        print(f"WARNING: SENDER_EMAIL / SENDER_APP_PASSWORD not set. "
+              f"Skipping notification email for: {reason}")
+        return
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(RECIPIENTS)
+    msg["Subject"] = f"Daily Filing Report ({report_date}) — No Report Today"
+    msg.set_content(
+        f"No EDGAR filing report was generated for {report_date}.\n\n"
+        f"Reason: {reason}\n\n"
+        f"The SEC does not process filings on weekends or federal holidays.\n"
+        f"The next report will cover the next regular trading day."
+    )
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+        print(f"Skip notification sent to: {', '.join(RECIPIENTS)}")
+    except Exception as e:
+        print(f"WARNING: Failed to send skip notification email: {e}")
+
+
+# Check weekend
+if dt.weekday() == 5:
+    reason = f"Saturday — EDGAR is closed on weekends"
+    print(f"Skipping {input_date}: {reason}")
+    send_skip_notification(input_date, reason)
+    sys.exit(0)
+
+if dt.weekday() == 6:
+    reason = f"Sunday — EDGAR is closed on weekends"
+    print(f"Skipping {input_date}: {reason}")
+    send_skip_notification(input_date, reason)
+    sys.exit(0)
+
+# Check US federal holidays (SEC observes all of them)
+fed_holidays = us_holidays.UnitedStates(years=dt.year)
+holiday_date = dt.date()
+if holiday_date in fed_holidays:
+    holiday_name = fed_holidays[holiday_date]
+    reason = f"US Federal Holiday — {holiday_name}"
+    print(f"Skipping {input_date}: {reason}")
+    send_skip_notification(input_date, reason)
+    sys.exit(0)
+
+# =============================================================================
+# NORMAL PROCESSING (weekday, non-holiday)
+# =============================================================================
 
 # Date-stamped output file so each day's report is kept separately
 OUTPUT_FILE = f"filing_report_{input_date}.xlsx"
@@ -96,7 +162,6 @@ limiter = RateLimiter(REQ_PER_SEC)
 # =========================
 # YEAR & QUARTER
 # =========================
-dt = datetime.strptime(input_date, "%Y-%m-%d")
 year = dt.year
 quarter = (dt.month - 1) // 3 + 1
 
