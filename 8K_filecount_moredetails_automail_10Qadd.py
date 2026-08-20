@@ -50,7 +50,8 @@ dt = datetime.strptime(input_date, "%Y-%m-%d")
 RECIPIENTS = [
     "auditfeeteam@gmail.com",
     "santhakumarcu@gmail.com",
-    "maharajasm2186@gmail.com",
+    "maharaja@secanalyzer.net",
+    "chandru@secanalyzer.net",
 ]
 
 # =============================================================================
