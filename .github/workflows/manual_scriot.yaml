@@ -38,7 +38,7 @@ jobs:
       - name: Checkout manual-report branch
         uses: actions/checkout@v4
         with:
-          ref: manual_onrequirement.py      # <- the branch where the manual script lives
+          ref: Manual_script      # <- the branch where the manual script lives
           fetch-depth: 1
 
       - name: Set up Python
