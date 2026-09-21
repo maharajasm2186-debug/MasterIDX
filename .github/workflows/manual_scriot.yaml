@@ -80,7 +80,7 @@ jobs:
           SENDER_EMAIL:         ${{ inputs.email_report && secrets.SENDER_EMAIL         || '' }}
           SENDER_APP_PASSWORD:  ${{ inputs.email_report && secrets.SENDER_APP_PASSWORD  || '' }}
         run: |
-          python manual_report.py
+          python manual_onrequirement.py
 
       - name: Upload report as artifact
         uses: actions/upload-artifact@v4
