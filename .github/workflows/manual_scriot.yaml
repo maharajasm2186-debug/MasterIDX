@@ -1,0 +1,92 @@
+name: Manual SEC Filing Report
+
+# Only runs when YOU click "Run workflow" — no schedule, no push, no PR.
+on:
+  workflow_dispatch:
+    inputs:
+      form_types:
+        description: 'Form types — comma separated prefixes, or ALL (blank = use manual_config.ini)'
+        required: false
+        default: ''
+      start_date:
+        description: 'Start date YYYY-MM-DD (blank = use manual_config.ini)'
+        required: false
+        default: ''
+      end_date:
+        description: 'End date YYYY-MM-DD (blank = use manual_config.ini)'
+        required: false
+        default: ''
+      date:
+        description: 'Single date YYYY-MM-DD — overrides start/end (blank = ignore)'
+        required: false
+        default: ''
+      email_report:
+        description: 'Send the email?'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  run-manual-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout manual-report branch
+        uses: actions/checkout@v4
+        with:
+          ref: manual-report      # <- the branch where the manual script lives
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas openpyxl holidays
+
+      - name: Override config with workflow inputs (only if provided)
+        if: ${{ inputs.form_types != '' || inputs.date != '' || inputs.start_date != '' || inputs.end_date != '' }}
+        env:
+          IN_FORM_TYPES: ${{ inputs.form_types }}
+          IN_DATE:       ${{ inputs.date }}
+          IN_START:      ${{ inputs.start_date }}
+          IN_END:        ${{ inputs.end_date }}
+        run: |
+          python - <<'PY'
+          import os, configparser, pathlib
+          p = pathlib.Path("manual_config.ini")
+          cfg = configparser.ConfigParser(interpolation=None)
+          cfg.read(p)
+          s = cfg["report"]
+          if os.environ.get("IN_FORM_TYPES"): s["form_types"] = os.environ["IN_FORM_TYPES"]
+          if os.environ.get("IN_DATE"):       s["date"]        = os.environ["IN_DATE"]
+          if os.environ.get("IN_START"):      s["start_date"]  = os.environ["IN_START"]
+          if os.environ.get("IN_END"):        s["end_date"]    = os.environ["IN_END"]
+          with p.open("w") as f:
+              cfg.write(f)
+          print("Effective config:")
+          print(p.read_text())
+          PY
+
+      - name: Run manual report
+        env:
+          SENDER_EMAIL:         ${{ inputs.email_report && secrets.SENDER_EMAIL         || '' }}
+          SENDER_APP_PASSWORD:  ${{ inputs.email_report && secrets.SENDER_APP_PASSWORD  || '' }}
+        run: |
+          python manual_report.py
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-${{ github.run_id }}
+          path: manual_report_*.xlsx
+          if-no-files-found: warn
+          retention-days: 30
