@@ -52,7 +52,7 @@ RECIPIENTS = [
     "santhakumarcu@gmail.com",
     "maharaja@secanalyzer.net",
     "chandru@secanalyzer.net",
-    "lawrence.amalraj@secanalyzer.net",
+    "lawrenceamal@gmail.com",
 ]
 
 # =============================================================================
