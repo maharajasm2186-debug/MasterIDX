@@ -370,23 +370,34 @@ summary = build_summary(df_full, idx_totals)
 # ---------- Mail table 1: Form Group over the whole IDX date range ----------
 PERIOD_DESC = (start.strftime("%Y-%m-%d") if start == end else f"{start} → {end}")
 T1_COLS = ["Form Group", "Range of IDX Date", "Companies Released", "Fund Companies"]
-T2_COLS = ["IDX Date", "Companies Released", "Fund Companies"]
+ITEM_FLAGS = [("Item 5.02", "Item_5_02"), ("Item 5.07", "Item_5_07"), ("Item 4.01", "Item_4_01")]
+T2_COLS = ["IDX Date", "Companies Released", "Fund Companies"] + [f"8-K {n}" for n, _ in ITEM_FLAGS]
 
 def _counts(h):
     return [h["CIK"].nunique(),
             h.loc[h["Is_Fund"] == 1, "CIK"].nunique()]
 
 def build_formgroup_table(df, period):
-    rows = [[fg, period] + _counts(df[df["Form_Group"] == fg])
-            for fg in sorted(df["Form_Group"].unique(), key=_gkey)]
+    rows, base = [], []
+    for fg in sorted(df["Form_Group"].unique(), key=_gkey):
+        h = df[df["Form_Group"] == fg]
+        rows.append([fg, period] + _counts(h)); base.append(len(rows) - 1)
+        if fg == "8-K":                      # 8-K broken out by item (sub-rows, overlap allowed)
+            for name, flag in ITEM_FLAGS:
+                rows.append([f"8-K {name}", period] + _counts(h[h[flag] == 1]))
     out = pd.DataFrame(rows, columns=T1_COLS)
-    out.loc[len(out)] = ["TOTAL", period] + [int(out[c].sum()) for c in T1_COLS[2:]]
+    # TOTAL counts only the main form groups, not the 8-K item sub-rows
+    out.loc[len(out)] = ["TOTAL", period] + [int(out.loc[base, c].sum()) for c in T1_COLS[2:]]
     return out
 
 # ---------- Mail table 2: date wise (all form groups together) ----------
 def build_date_table(df):
-    rows = [[dt] + _counts(df[df["Date_Filed"] == dt])
-            for dt in sorted(df["Date_Filed"].unique())]
+    rows = []
+    for dt in sorted(df["Date_Filed"].unique()):
+        h = df[df["Date_Filed"] == dt]
+        k = h[h["Form_Group"] == "8-K"]
+        rows.append([dt] + _counts(h) + [k.loc[k[flag] == 1, "CIK"].nunique()
+                                         for _, flag in ITEM_FLAGS])
     out = pd.DataFrame(rows, columns=T2_COLS)
     out.loc[len(out)] = ["TOTAL"] + [int(out[c].sum()) for c in T2_COLS[1:]]
     return out
@@ -434,8 +445,10 @@ def summary_html(df, left=2):
             "<tr>" + "".join(f"<th {th}>{c}</th>" for c in df.columns) + "</tr>"]
     for i, row in df.iterrows():
         is_tot = row.iloc[0] == "TOTAL"
+        is_sub = str(row.iloc[0]).startswith("8-K Item")
         bg = "background:#d9e1f2;font-weight:bold;" if is_tot else \
-             ("background:#f7f7f7;" if i % 2 else "")
+             ("background:#fff8e1;font-style:italic;" if is_sub else
+              ("background:#f7f7f7;" if i % 2 else ""))
         cells = []
         for j, v in enumerate(row):
             al = "left" if j < left else "right"
@@ -502,6 +515,7 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"<p style='font-size:12px;color:#555'>{group_note}<br>"
         f"The detailed date × form group table is on the 'Summary' sheet. "
         f"Counts are unique companies (CIK). 'Industries' = distinct SIC industries. "
+        f"'8-K Item …' rows/columns = companies whose 8-K reported that item (a filing can report several, so they overlap and are not added into TOTAL). "
         f"'Fund Companies' = funds/ETFs/commodity pools (SIC or fund-name match), already included in 'Companies Released'; TOTAL rows are column sums.</p>"
         f"<p>8-K items flagged: Item 5.02: {n502} | Item 4.01: {n401} | Item 5.07: {n507}</p>"
         + (f"<p>Skipped (weekend/holiday): {'; '.join(f'{d} — {r}' for d, r in skipped)}</p>" if skipped else "")
