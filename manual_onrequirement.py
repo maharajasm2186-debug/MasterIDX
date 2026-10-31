@@ -137,13 +137,17 @@ BASE_DIR    = Path(__file__).resolve().parent
 INDEX_CACHE = BASE_DIR / "index_cache_v2.csv"
 INDEX_LOCAL = BASE_DIR / "index_constituents.csv"
 REFRESH_DAYS = section.getint("index_refresh_days", 7)
-WEB_HDR = {"User-Agent": "Mozilla/5.0 (compatible; SEC-Research/1.0)"}
+WEB_HDR = {"User-Agent": "SECReportBot/1.0 (contact: your_email@example.com)",
+           "Accept": "text/html,text/csv,*/*"}
+LOAD_ERR = {}          # index name → why it failed to load
 
 def _nt(t):   # normalise ticker
     return str(t).strip().upper().replace(".", "-").replace("/", "-")
 
-def _web(url):
-    r = requests.get(url, headers=WEB_HDR, timeout=TIMEOUT)
+def _web(url, referer=None):
+    h = dict(WEB_HDR)
+    if referer: h["Referer"] = referer
+    r = requests.get(url, headers=h, timeout=TIMEOUT)
     r.raise_for_status()
     return r.text
 
@@ -161,50 +165,68 @@ def _wiki(page, label):
                 rows.append((label, _nt(r[col]),
                              str(int(r[cikc])) if cikc is not None and pd.notna(r[cikc]) else ""))
             break
+        if not rows: LOAD_ERR[label] = "page loaded but no constituents table found"
     except Exception as e:
-        print(f"  ! {label} failed: {e}")
+        LOAD_ERR[label] = f"{type(e).__name__}: {str(e)[:140]}"
     return rows
 
 def _ishares(pid, slug, fund, label):
     rows = []
-    url = (f"https://www.ishares.com/us/products/{pid}/{slug}/"
-           f"1467271812596.ajax?fileType=csv&fileName={fund}_holdings&dataType=fund")
+    base = f"https://www.ishares.com/us/products/{pid}/{slug}"
+    url = f"{base}/1467271812596.ajax?fileType=csv&fileName={fund}_holdings&dataType=fund"
     try:
-        lines = _web(url).splitlines()
-        h = next(i for i, l in enumerate(lines) if l.startswith("Ticker"))
+        lines = _web(url, referer=base).lstrip("\ufeff").splitlines()
+        h = next(i for i, l in enumerate(lines) if l.strip('"\ufeff ').startswith("Ticker"))
         df = pd.read_csv(StringIO("\n".join(lines[h:])), dtype=str)
         if "Asset Class" in df.columns: df = df[df["Asset Class"] == "Equity"]
         rows = [(label, _nt(t), "") for t in df["Ticker"].dropna()]
+        if not rows: LOAD_ERR[label] = "file loaded but no tickers parsed"
+    except StopIteration:
+        LOAD_ERR[label] = "response was not a holdings CSV (site blocked or URL changed)"
     except Exception as e:
-        print(f"  ! {label} failed (provide it in index_constituents.csv): {e}")
+        LOAD_ERR[label] = f"{type(e).__name__}: {str(e)[:140]}"
     return rows
 
-def _load_all():
-    return (
-        _wiki("List_of_S%26P_500_companies", "S&P 500")
-        + _wiki("List_of_S%26P_400_companies", "S&P 400")
-        + _wiki("List_of_S%26P_600_companies", "S&P 600")
-        + _wiki("S%26P_100", "S&P 100")
-        + _wiki("Nasdaq-100", "NASDAQ 100")
-        + _ishares(239707, "ishares-russell-1000-etf", "IWB", "Russell 1000")
-        + _ishares(239710, "ishares-russell-2000-etf", "IWM", "Russell 2000")
-        + _ishares(239714, "ishares-russell-3000-etf", "IWV", "Russell 3000")
-    )
+LOADERS = {
+    "S&P 500":      lambda: _wiki("List_of_S%26P_500_companies", "S&P 500"),
+    "S&P 400":      lambda: _wiki("List_of_S%26P_400_companies", "S&P 400"),
+    "S&P 600":      lambda: _wiki("List_of_S%26P_600_companies", "S&P 600"),
+    "S&P 100":      lambda: _wiki("S%26P_100", "S&P 100"),
+    "NASDAQ 100":   lambda: _wiki("Nasdaq-100", "NASDAQ 100"),
+    "Russell 1000": lambda: _ishares(239707, "ishares-russell-1000-etf", "IWB", "Russell 1000"),
+    "Russell 2000": lambda: _ishares(239710, "ishares-russell-2000-etf", "IWM", "Russell 2000"),
+    "Russell 3000": lambda: _ishares(239714, "ishares-russell-3000-etf", "IWV", "Russell 3000"),
+}
 
 def load_index_members():
-    df = None
-    if INDEX_CACHE.exists() and (time.time() - INDEX_CACHE.stat().st_mtime) < REFRESH_DAYS*86400:
+    cached = pd.DataFrame(columns=["Index", "Ticker", "CIK"])
+    fresh = False
+    if INDEX_CACHE.exists():
         try:
-            df = pd.read_csv(INDEX_CACHE, dtype=str).fillna("")
-            print(f"Index cache used: {INDEX_CACHE.name}")
+            cached = pd.read_csv(INDEX_CACHE, dtype=str).fillna("")
+            fresh = (time.time() - INDEX_CACHE.stat().st_mtime) < REFRESH_DAYS*86400
         except Exception:
-            df = None
-    if df is None:
-        print("Loading index constituents (Russell 1000/2000/3000, S&P 100/500/400/600, NASDAQ 100) ...")
-        rows = _load_all()
-        df = pd.DataFrame(rows, columns=["Index", "Ticker", "CIK"])
-        if not df.empty:
-            df.to_csv(INDEX_CACHE, index=False)
+            pass
+    have = set(cached["Index"]) if fresh else set()
+    df = cached if fresh else pd.DataFrame(columns=["Index", "Ticker", "CIK"])
+    missing = [n for n in INDEX_NAMES if n not in have]
+    fetched = []
+    for n in missing:
+        print(f"  Loading {n} ...")
+        rows = LOADERS[n]()
+        print(f"    → {len(rows)} rows" + (f"   ! {LOAD_ERR[n]}" if n in LOAD_ERR else ""))
+        if rows:
+            fetched += rows
+        else:                                   # fetch failed → fall back to old committed/cached copy
+            old = cached[cached["Index"] == n]
+            if not fresh and not old.empty:
+                df = pd.concat([df, old], ignore_index=True)
+                LOAD_ERR[n] = LOAD_ERR.get(n, "no rows") + "  (using OLD cached list)"
+                print(f"    → using {len(old)} rows from old cache")
+    if fetched:
+        df = pd.concat([df, pd.DataFrame(fetched, columns=["Index", "Ticker", "CIK"])],
+                       ignore_index=True)
+        df.to_csv(INDEX_CACHE, index=False)       # only indices that actually loaded are cached
     if INDEX_LOCAL.exists():
         loc = pd.read_csv(INDEX_LOCAL, dtype=str).fillna("")
         for c in ("Index", "Ticker", "CIK"):
@@ -218,12 +240,18 @@ def load_index_members():
         if tk: t_map.setdefault(tk, set()).add(ix)
         if ck: c_map.setdefault(ck, set()).add(ix)
     counts = df.groupby("Index").size().to_dict() if not df.empty else {}
+    print("Index constituents available:")
     for n in INDEX_NAMES:
-        print(f"  {n:13s}: {counts.get(n, 0)} constituents")
+        print(f"  {n:13s}: {counts.get(n, 0)}")
     warns = [n for n in INDEX_NAMES if counts.get(n, 0) == 0]
-    return t_map, c_map, warns
+    if warns:
+        print("\n" + "!"*70 +
+              f"\n!! NO constituents for: {', '.join(warns)}\n"
+              "!! Index columns will be 0 for these. Fix network access or supply\n"
+              "!! index_constituents.csv (Index,Ticker,CIK).\n" + "!"*70 + "\n")
+    return t_map, c_map, warns, counts
 
-TICKER_IDX, CIK_IDX, INDEX_WARN = load_index_members()
+TICKER_IDX, CIK_IDX, INDEX_WARN, INDEX_COUNTS = load_index_members()
 
 def membership(cik, tickers):
     s = set(CIK_IDX.get(str(cik).lstrip("0"), set()))
@@ -397,8 +425,18 @@ for _n, _c in zip(INDEX_NAMES, FLAG_COLS):
     df_full[_c] = _mem.apply(lambda x, n=_n: 1 if n in x else 0)
 df_full["In_Any_Index"] = (df_full[FLAG_COLS].sum(axis=1) > 0).astype(int)
 df_full["Index_Membership"] = _mem.apply(
-    lambda s: "; ".join(n for n in INDEX_NAMES if n in s) or "None")
+    lambda s: "; ".join(n for n in INDEX_NAMES if n in s) or "No Index")
 df_full["Industry"] = df_full["Industry"].fillna("Unknown")
+
+# ---------- Index load / match diagnostics ----------
+index_status = pd.DataFrame([{
+    "Index": n,
+    "Constituents Loaded": INDEX_COUNTS.get(n, 0),
+    "Filings Matched": int(df_full[c].sum()),
+    "Companies Matched": df_full.loc[df_full[c] == 1, "CIK"].nunique(),
+    "Load Problem": LOAD_ERR.get(n, ""),
+} for n, c in zip(INDEX_NAMES, FLAG_COLS)])
+print("\nIndex match summary:\n" + index_status.to_string(index=False))
 
 ORDER = [
     "Date_Filed","CIK","Company","Company_Name_API","Tickers",
@@ -454,6 +492,36 @@ def build_summary(df, totals):
 
 summary = build_summary(df_full, idx_totals)
 
+# ---------- Mail table 1: Form Group over the whole IDX date range ----------
+PERIOD_DESC = (start.strftime("%Y-%m-%d") if start == end else f"{start} → {end}")
+T1_COLS = ["Form Group", "Range of IDX Date", "Companies Released",
+           "Companies in Indices", "Companies Not in Indices"]
+T2_COLS = ["IDX Date", "Companies Released",
+           "Companies in Indices", "Companies Not in Indices"]
+
+def _counts(h):
+    return [h["CIK"].nunique(),
+            h.loc[h["In_Any_Index"] == 1, "CIK"].nunique(),
+            h.loc[h["In_Any_Index"] == 0, "CIK"].nunique()]
+
+def build_formgroup_table(df, period):
+    rows = [[fg, period] + _counts(df[df["Form_Group"] == fg])
+            for fg in sorted(df["Form_Group"].unique(), key=_gkey)]
+    out = pd.DataFrame(rows, columns=T1_COLS)
+    out.loc[len(out)] = ["TOTAL", period] + [int(out[c].sum()) for c in T1_COLS[2:]]
+    return out
+
+# ---------- Mail table 2: date wise (all form groups together) ----------
+def build_date_table(df):
+    rows = [[dt] + _counts(df[df["Date_Filed"] == dt])
+            for dt in sorted(df["Date_Filed"].unique())]
+    out = pd.DataFrame(rows, columns=T2_COLS)
+    out.loc[len(out)] = ["TOTAL"] + [int(out[c].sum()) for c in T2_COLS[1:]]
+    return out
+
+table_formgroup = build_formgroup_table(df_full, PERIOD_DESC)
+table_datewise  = build_date_table(df_full)
+
 industry_breakdown = (
     df_full.groupby(["Date_Filed", "Form_Group", "Industry"])
     .agg(Companies=("CIK", "nunique"),
@@ -464,7 +532,8 @@ industry_breakdown = (
 )
 
 _ic = []
-for (_dt, _fg), _h in df_full.groupby(["Date_Filed", "Form_Group"]):
+for (_dt, _fg), _h in sorted(df_full.groupby(["Date_Filed", "Form_Group"]),
+                             key=lambda kv: (kv[0][0], _gkey(kv[0][1]))):
     _r = {"IDX Date": _dt, "Form Group": _fg, "Companies": _h["CIK"].nunique()}
     for _n, _c in zip(INDEX_NAMES, FLAG_COLS):
         _r[_n] = _h.loc[_h[_c] == 1, "CIK"].nunique()
@@ -481,9 +550,12 @@ period_tag = (start.strftime("%Y-%m-%d") if start == end
 OUTPUT_FILE = f"manual_report_{period_tag}_{tag}.xlsx"
 
 with pd.ExcelWriter(OUTPUT_FILE) as w:
+    table_formgroup.to_excel(w, sheet_name="FormGroup_Range", index=False)
+    table_datewise.to_excel(w, sheet_name="Date_Wise", index=False)
     summary.to_excel(w, sheet_name="Summary", index=False)
     industry_breakdown.to_excel(w, sheet_name="Industry_Breakdown", index=False)
     index_counts.to_excel(w, sheet_name="Index_Counts", index=False)
+    index_status.to_excel(w, sheet_name="Index_Status", index=False)
     df_full.to_excel(w, sheet_name="All_Properties", index=False)
     for ws in w.book.worksheets:
         ws.freeze_panes = "A2"
@@ -495,7 +567,7 @@ print(f"\nReport Generated: {OUTPUT_FILE}   ({len(df_full)} rows)")
 # =============================================================================
 # EMAIL  (tabulated, grouped)
 # =============================================================================
-def summary_html(df):
+def summary_html(df, left=2):
     th = ("style='border:1px solid #999;padding:6px 10px;background:#1f3864;"
           "color:#fff;text-align:center;font-size:13px'")
     html = ["<table style='border-collapse:collapse;font-family:Arial,sans-serif'>",
@@ -506,7 +578,7 @@ def summary_html(df):
              ("background:#f7f7f7;" if i % 2 else "")
         cells = []
         for j, v in enumerate(row):
-            al = "left" if j < 2 else "right"
+            al = "left" if j < left else "right"
             cells.append(f"<td style='border:1px solid #bbb;padding:5px 10px;"
                          f"text-align:{al};font-size:13px;{bg}'>{v}</td>")
         html.append("<tr>" + "".join(cells) + "</tr>")
@@ -556,7 +628,8 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"Form filter       : {form_desc}\n"
         f"Filings scanned   : {n_total}\n"
         f"Filings in report : {n_matched}\n\n"
-        f"{summary.to_string(index=False)}\n\n"
+        f"Table 1 — Form Group (IDX range {period_desc})\n{table_formgroup.to_string(index=False)}\n\n"
+        f"Table 2 — Date wise\n{table_datewise.to_string(index=False)}\n\n"
         f"{group_note}\n\n"
         f"8-K items flagged:  5.02: {n502} | 4.01: {n401} | 5.07: {n507}\n"
         f"{skipped_txt}{empty_txt}{warn_txt}\n"
@@ -566,11 +639,14 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"<p><b>Manual SEC filing report</b><br>"
         f"Date period: {period_desc}<br>Form filter: {form_desc}<br>"
         f"Filings scanned: {n_total} &nbsp;|&nbsp; Filings in report: {n_matched}</p>"
-        f"{summary_html(summary)}"
+        f"<p><b>Table 1 — Form Group (IDX range {period_desc})</b></p>"
+        f"{summary_html(table_formgroup, left=2)}"
+        f"<p><b>Table 2 — Date wise</b></p>"
+        f"{summary_html(table_datewise, left=1)}"
         f"<p style='font-size:12px;color:#555'>{group_note}<br>"
-        f"Indices checked: {', '.join(INDEX_NAMES)}. Per-index counts are on the 'Index_Counts' sheet. "
+        f"Indices checked: {', '.join(INDEX_NAMES)}. Per-index counts are on the 'Index_Counts' sheet; the detailed date × form group table is on 'Summary'. "
         f"Counts are unique companies (CIK). 'Industries' = distinct SIC industries. "
-        f"'Total IDX Date Releases' = all filings on that IDX date (every form type).</p>"
+        f"'In Indices' = member of any of the 8 indices; TOTAL rows are column sums.</p>"
         f"<p>8-K items flagged: Item 5.02: {n502} | Item 4.01: {n401} | Item 5.07: {n507}</p>"
         + (f"<p>Skipped (weekend/holiday): {'; '.join(f'{d} — {r}' for d, r in skipped)}</p>" if skipped else "")
         + (f"<p>Dates with no index entries: {', '.join(empty_days)}</p>" if empty_days else "")
