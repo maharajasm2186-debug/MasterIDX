@@ -14,7 +14,7 @@ import holidays as us_holidays
 # • All requirements live in manual_config.ini (form types + date period).
 # • Independent of the daily cron script — never modifies it.
 # • NEW: form-type variants are grouped (10-K, 10-Q, 8-K, DEF, 20-F, 40-F ...)
-# • NEW: Russell / S&P / NASDAQ membership flags in Excel + tabulated email
+# • Fund companies are flagged (Is_Fund) and counted in a separate column
 # =============================================================================
 
 CONFIG_FILE = Path(__file__).resolve().with_name("manual_config.ini")
@@ -122,142 +122,23 @@ class RateLimiter:
 limiter = RateLimiter(REQ_PER_SEC)
 
 # =============================================================================
-# INDEX MEMBERSHIP  (Russell, S&P, NASDAQ)
+# FUND COMPANY DETECTION
 # -----------------------------------------------------------------------------
-# Auto-loaded from public sources and cached in index_cache.csv (refreshed
-# every `index_refresh_days`, default 7).  You can ALWAYS add / override with
-# a local file  index_constituents.csv  having columns:  Index,Ticker,CIK
-#   (Index must be exactly one of INDEX_NAMES above; Ticker or CIK may be blank)
+# A filer is marked Is_Fund = 1 when its SEC SIC code is a fund-type code OR its
+# name contains a fund keyword.  Both can be overridden in manual_config.ini:
+#   fund_sic_codes  = 6726,6722,6221
+#   fund_name_regex = \b(FUNDS?|ETFS?|ISHARES|SPDR)\b
 # =============================================================================
-INDEX_NAMES = ["Russell 1000", "Russell 2000", "Russell 3000",
-               "S&P 100", "S&P 500", "S&P 400", "S&P 600", "NASDAQ 100"]
-FLAG_COLS   = ["In_" + re.sub(r"\W+", "_", n) for n in INDEX_NAMES]
-BASE_DIR    = Path(__file__).resolve().parent
-INDEX_CACHE = BASE_DIR / "index_cache_v2.csv"
-INDEX_LOCAL = BASE_DIR / "index_constituents.csv"
-REFRESH_DAYS = section.getint("index_refresh_days", 7)
-WEB_HDR = {"User-Agent": "SECReportBot/1.0 (contact: your_email@example.com)",
-           "Accept": "text/html,text/csv,*/*"}
-LOAD_ERR = {}          # index name → why it failed to load
+FUND_SICS = {x.strip() for x in section.get("fund_sic_codes", "6726,6722,6221").split(",") if x.strip()}
+FUND_NAME_RX = re.compile(
+    section.get("fund_name_regex",
+                r"\b(FUNDS?|ETFS?|ISHARES|SPDR|PROSHARES|WISDOMTREE|VANECK|GRAYSCALE|COMMODITY POOL)\b"),
+    re.I)
 
-def _nt(t):   # normalise ticker
-    return str(t).strip().upper().replace(".", "-").replace("/", "-")
-
-def _web(url, referer=None):
-    h = dict(WEB_HDR)
-    if referer: h["Referer"] = referer
-    r = requests.get(url, headers=h, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
-
-def _wiki(page, label):
-    rows = []
-    try:
-        html = _web(f"https://en.wikipedia.org/wiki/{page}")
-        for t in pd.read_html(StringIO(html)):
-            col = next((c for c in t.columns if str(c).strip() in
-                        ("Symbol", "Ticker symbol", "Ticker")), None)
-            if col is None: continue
-            cikc = next((c for c in t.columns if str(c).strip() == "CIK"), None)
-            for _, r in t.iterrows():
-                if pd.isna(r[col]): continue
-                rows.append((label, _nt(r[col]),
-                             str(int(r[cikc])) if cikc is not None and pd.notna(r[cikc]) else ""))
-            break
-        if not rows: LOAD_ERR[label] = "page loaded but no constituents table found"
-    except Exception as e:
-        LOAD_ERR[label] = f"{type(e).__name__}: {str(e)[:140]}"
-    return rows
-
-def _ishares(pid, slug, fund, label):
-    rows = []
-    base = f"https://www.ishares.com/us/products/{pid}/{slug}"
-    url = f"{base}/1467271812596.ajax?fileType=csv&fileName={fund}_holdings&dataType=fund"
-    try:
-        lines = _web(url, referer=base).lstrip("\ufeff").splitlines()
-        h = next(i for i, l in enumerate(lines) if l.strip('"\ufeff ').startswith("Ticker"))
-        df = pd.read_csv(StringIO("\n".join(lines[h:])), dtype=str)
-        if "Asset Class" in df.columns: df = df[df["Asset Class"] == "Equity"]
-        rows = [(label, _nt(t), "") for t in df["Ticker"].dropna()]
-        if not rows: LOAD_ERR[label] = "file loaded but no tickers parsed"
-    except StopIteration:
-        LOAD_ERR[label] = "response was not a holdings CSV (site blocked or URL changed)"
-    except Exception as e:
-        LOAD_ERR[label] = f"{type(e).__name__}: {str(e)[:140]}"
-    return rows
-
-LOADERS = {
-    "S&P 500":      lambda: _wiki("List_of_S%26P_500_companies", "S&P 500"),
-    "S&P 400":      lambda: _wiki("List_of_S%26P_400_companies", "S&P 400"),
-    "S&P 600":      lambda: _wiki("List_of_S%26P_600_companies", "S&P 600"),
-    "S&P 100":      lambda: _wiki("S%26P_100", "S&P 100"),
-    "NASDAQ 100":   lambda: _wiki("Nasdaq-100", "NASDAQ 100"),
-    "Russell 1000": lambda: _ishares(239707, "ishares-russell-1000-etf", "IWB", "Russell 1000"),
-    "Russell 2000": lambda: _ishares(239710, "ishares-russell-2000-etf", "IWM", "Russell 2000"),
-    "Russell 3000": lambda: _ishares(239714, "ishares-russell-3000-etf", "IWV", "Russell 3000"),
-}
-
-def load_index_members():
-    cached = pd.DataFrame(columns=["Index", "Ticker", "CIK"])
-    fresh = False
-    if INDEX_CACHE.exists():
-        try:
-            cached = pd.read_csv(INDEX_CACHE, dtype=str).fillna("")
-            fresh = (time.time() - INDEX_CACHE.stat().st_mtime) < REFRESH_DAYS*86400
-        except Exception:
-            pass
-    have = set(cached["Index"]) if fresh else set()
-    df = cached if fresh else pd.DataFrame(columns=["Index", "Ticker", "CIK"])
-    missing = [n for n in INDEX_NAMES if n not in have]
-    fetched = []
-    for n in missing:
-        print(f"  Loading {n} ...")
-        rows = LOADERS[n]()
-        print(f"    → {len(rows)} rows" + (f"   ! {LOAD_ERR[n]}" if n in LOAD_ERR else ""))
-        if rows:
-            fetched += rows
-        else:                                   # fetch failed → fall back to old committed/cached copy
-            old = cached[cached["Index"] == n]
-            if not fresh and not old.empty:
-                df = pd.concat([df, old], ignore_index=True)
-                LOAD_ERR[n] = LOAD_ERR.get(n, "no rows") + "  (using OLD cached list)"
-                print(f"    → using {len(old)} rows from old cache")
-    if fetched:
-        df = pd.concat([df, pd.DataFrame(fetched, columns=["Index", "Ticker", "CIK"])],
-                       ignore_index=True)
-        df.to_csv(INDEX_CACHE, index=False)       # only indices that actually loaded are cached
-    if INDEX_LOCAL.exists():
-        loc = pd.read_csv(INDEX_LOCAL, dtype=str).fillna("")
-        for c in ("Index", "Ticker", "CIK"):
-            if c not in loc.columns: loc[c] = ""
-        loc["Ticker"] = loc["Ticker"].apply(lambda x: _nt(x) if x else "")
-        df = pd.concat([df, loc[["Index", "Ticker", "CIK"]]], ignore_index=True)
-        print(f"Local overrides merged: {INDEX_LOCAL.name} ({len(loc)} rows)")
-    df["CIK"] = df["CIK"].astype(str).str.lstrip("0")
-    t_map, c_map = {}, {}
-    for ix, tk, ck in df[["Index", "Ticker", "CIK"]].itertuples(index=False):
-        if tk: t_map.setdefault(tk, set()).add(ix)
-        if ck: c_map.setdefault(ck, set()).add(ix)
-    counts = df.groupby("Index").size().to_dict() if not df.empty else {}
-    print("Index constituents available:")
-    for n in INDEX_NAMES:
-        print(f"  {n:13s}: {counts.get(n, 0)}")
-    warns = [n for n in INDEX_NAMES if counts.get(n, 0) == 0]
-    if warns:
-        print("\n" + "!"*70 +
-              f"\n!! NO constituents for: {', '.join(warns)}\n"
-              "!! Index columns will be 0 for these. Fix network access or supply\n"
-              "!! index_constituents.csv (Index,Ticker,CIK).\n" + "!"*70 + "\n")
-    return t_map, c_map, warns, counts
-
-TICKER_IDX, CIK_IDX, INDEX_WARN, INDEX_COUNTS = load_index_members()
-
-def membership(cik, tickers):
-    s = set(CIK_IDX.get(str(cik).lstrip("0"), set()))
-    for t in str(tickers or "").split(","):
-        t = _nt(t)
-        if t: s |= TICKER_IDX.get(t, set())
-    return s
+def is_fund(row):
+    sic = str(row.get("SIC") or "").split(".")[0].strip()
+    name = f"{row.get('Company') or ''} {row.get('Company_Name_API') or ''}"
+    return 1 if (sic in FUND_SICS or FUND_NAME_RX.search(name)) else 0
 
 # =============================================================================
 # EDGAR INDEX
@@ -418,29 +299,13 @@ df_full["Item_5_02"] = df_full["Items"].apply(lambda x: _has_item(x, "5.02"))
 df_full["Item_4_01"] = df_full["Items"].apply(lambda x: _has_item(x, "4.01"))
 df_full["Item_5_07"] = df_full["Items"].apply(lambda x: _has_item(x, "5.07"))
 
-# ---------- Index membership (Russell / S&P / NASDAQ) ----------
-_mem = df_full.apply(lambda r: membership(r["CIK"], r.get("Tickers")), axis=1)
-for _n, _c in zip(INDEX_NAMES, FLAG_COLS):
-    df_full[_c] = _mem.apply(lambda x, n=_n: 1 if n in x else 0)
-df_full["In_Any_Index"] = (df_full[FLAG_COLS].sum(axis=1) > 0).astype(int)
-df_full["Index_Membership"] = _mem.apply(
-    lambda s: "; ".join(n for n in INDEX_NAMES if n in s) or "No Index")
+# ---------- Fund company flag ----------
+df_full["Is_Fund"] = df_full.apply(is_fund, axis=1)
 df_full["Industry"] = df_full["Industry"].fillna("Unknown")
-
-# ---------- Index load / match diagnostics ----------
-index_status = pd.DataFrame([{
-    "Index": n,
-    "Constituents Loaded": INDEX_COUNTS.get(n, 0),
-    "Filings Matched": int(df_full[c].sum()),
-    "Companies Matched": df_full.loc[df_full[c] == 1, "CIK"].nunique(),
-    "Load Problem": LOAD_ERR.get(n, ""),
-} for n, c in zip(INDEX_NAMES, FLAG_COLS)])
-print("\nIndex match summary:\n" + index_status.to_string(index=False))
 
 ORDER = [
     "Date_Filed","CIK","Company","Company_Name_API","Tickers",
-    "Form_Type","Form_Group","Index_Membership",*FLAG_COLS,
-    "In_Any_Index","Report_Date",
+    "Form_Type","Form_Group","Is_Fund","Report_Date",
     "Accession_No","Filing_URL","Acceptance_DateTime","Act","File_Number",
     "Film_Number","Size","Is_XBRL","Is_Inline_XBRL","Primary_Document",
     "Primary_Doc_Description","Items","Item_5_02","Item_4_01","Item_5_07",
@@ -461,9 +326,8 @@ COLS = [
     "IDX Date",
     "Form Group",
     "Companies Released",
+    "Fund Companies",
     "Industries",
-    "Companies NOT in Russell/S&P/NASDAQ",
-    "Companies in Russell/S&P/NASDAQ",
     "Total IDX Date Releases",
 ]
 
@@ -476,15 +340,14 @@ def build_summary(df, totals):
         g_day = df[df["Date_Filed"] == dt]
         for fg in sorted(g_day["Form_Group"].unique(), key=_gkey):
             h = g_day[g_day["Form_Group"] == fg]
-            n_in  = h.loc[h["In_Any_Index"] == 1, "CIK"].nunique()
-            n_out = h.loc[h["In_Any_Index"] == 0, "CIK"].nunique()
-            rows.append([dt, fg, h["CIK"].nunique(), h["Industry"].nunique(),
-                         n_out, n_in, totals.get(dt, 0)])
+            rows.append([dt, fg, h["CIK"].nunique(),
+                         h.loc[h["Is_Fund"] == 1, "CIK"].nunique(),
+                         h["Industry"].nunique(), totals.get(dt, 0)])
     out = pd.DataFrame(rows, columns=COLS)
     dates_present = out["IDX Date"].unique()
     total = ["TOTAL", "",
              int(out[COLS[2]].sum()), int(out[COLS[3]].sum()),
-             int(out[COLS[4]].sum()), int(out[COLS[5]].sum()),
+             int(out[COLS[4]].sum()),
              int(sum(totals.get(d, 0) for d in dates_present))]
     out.loc[len(out)] = total
     return out
@@ -493,15 +356,12 @@ summary = build_summary(df_full, idx_totals)
 
 # ---------- Mail table 1: Form Group over the whole IDX date range ----------
 PERIOD_DESC = (start.strftime("%Y-%m-%d") if start == end else f"{start} → {end}")
-T1_COLS = ["Form Group", "Range of IDX Date", "Companies Released",
-           "Companies in Indices", "Companies Not in Indices"]
-T2_COLS = ["IDX Date", "Companies Released",
-           "Companies in Indices", "Companies Not in Indices"]
+T1_COLS = ["Form Group", "Range of IDX Date", "Companies Released", "Fund Companies"]
+T2_COLS = ["IDX Date", "Companies Released", "Fund Companies"]
 
 def _counts(h):
     return [h["CIK"].nunique(),
-            h.loc[h["In_Any_Index"] == 1, "CIK"].nunique(),
-            h.loc[h["In_Any_Index"] == 0, "CIK"].nunique()]
+            h.loc[h["Is_Fund"] == 1, "CIK"].nunique()]
 
 def build_formgroup_table(df, period):
     rows = [[fg, period] + _counts(df[df["Form_Group"] == fg])
@@ -524,20 +384,10 @@ table_datewise  = build_date_table(df_full)
 industry_breakdown = (
     df_full.groupby(["Date_Filed", "Form_Group", "Industry"])
     .agg(Companies=("CIK", "nunique"),
-         In_Index=("In_Any_Index", lambda s: df_full.loc[s.index][s == 1]["CIK"].nunique()),
-         Not_In_Index=("In_Any_Index", lambda s: df_full.loc[s.index][s == 0]["CIK"].nunique()))
+         Fund_Companies=("Is_Fund", lambda s: df_full.loc[s.index][s == 1]["CIK"].nunique()))
     .reset_index()
     .sort_values(["Date_Filed", "Form_Group", "Companies"], ascending=[True, True, False])
 )
-
-_ic = []
-for (_dt, _fg), _h in sorted(df_full.groupby(["Date_Filed", "Form_Group"]),
-                             key=lambda kv: (kv[0][0], _gkey(kv[0][1]))):
-    _r = {"IDX Date": _dt, "Form Group": _fg, "Companies": _h["CIK"].nunique()}
-    for _n, _c in zip(INDEX_NAMES, FLAG_COLS):
-        _r[_n] = _h.loc[_h[_c] == 1, "CIK"].nunique()
-    _ic.append(_r)
-index_counts = pd.DataFrame(_ic)
 
 # =============================================================================
 # EXPORT
@@ -553,8 +403,6 @@ with pd.ExcelWriter(OUTPUT_FILE) as w:
     table_datewise.to_excel(w, sheet_name="Date_Wise", index=False)
     summary.to_excel(w, sheet_name="Summary", index=False)
     industry_breakdown.to_excel(w, sheet_name="Industry_Breakdown", index=False)
-    index_counts.to_excel(w, sheet_name="Index_Counts", index=False)
-    index_status.to_excel(w, sheet_name="Index_Status", index=False)
     df_full.to_excel(w, sheet_name="All_Properties", index=False)
     for ws in w.book.worksheets:
         ws.freeze_panes = "A2"
@@ -606,10 +454,6 @@ def send_report(path, recipients, ps, pe, form_prefixes,
     empty_txt = ""
     if empty_days:
         empty_txt = "\nDates with no index entries:\n  " + ", ".join(empty_days) + "\n"
-    warn_txt = ""
-    if INDEX_WARN:
-        warn_txt = ("\nNOTE: no constituents loaded for: " + ", ".join(INDEX_WARN) +
-                    " — those companies are counted as 'not in index'.\n")
 
     group_note = ("Form groups: 10-K = 10-K, 10-KT, 10-K/A, 10-KT/A | "
                   "10-Q = 10-Q, 10-QT, 10-Q/A, 10-QT/A | 8-K = 8-K, 8-K/A | "
@@ -631,8 +475,8 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"Table 2 — Date wise\n{table_datewise.to_string(index=False)}\n\n"
         f"{group_note}\n\n"
         f"8-K items flagged:  5.02: {n502} | 4.01: {n401} | 5.07: {n507}\n"
-        f"{skipped_txt}{empty_txt}{warn_txt}\n"
-        f"Per-index flags and all SEC properties are in the attached workbook."
+        f"{skipped_txt}{empty_txt}\n"
+        f"All SEC properties (incl. Is_Fund flag) are in the attached workbook."
     )
     html = (
         f"<p><b>Manual SEC filing report</b><br>"
@@ -643,15 +487,13 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"<p><b>Table 2 — Date wise</b></p>"
         f"{summary_html(table_datewise, left=1)}"
         f"<p style='font-size:12px;color:#555'>{group_note}<br>"
-        f"Indices checked: {', '.join(INDEX_NAMES)}. Per-index counts are on the 'Index_Counts' sheet; the detailed date × form group table is on 'Summary'. "
+        f"The detailed date × form group table is on the 'Summary' sheet. "
         f"Counts are unique companies (CIK). 'Industries' = distinct SIC industries. "
-        f"'In Indices' = member of any of the 8 indices; TOTAL rows are column sums.</p>"
+        f"'Fund Companies' = funds/ETFs/commodity pools (SIC or fund-name match), already included in 'Companies Released'; TOTAL rows are column sums.</p>"
         f"<p>8-K items flagged: Item 5.02: {n502} | Item 4.01: {n401} | Item 5.07: {n507}</p>"
         + (f"<p>Skipped (weekend/holiday): {'; '.join(f'{d} — {r}' for d, r in skipped)}</p>" if skipped else "")
         + (f"<p>Dates with no index entries: {', '.join(empty_days)}</p>" if empty_days else "")
-        + (f"<p style='color:#b00'>NOTE: no constituents loaded for {', '.join(INDEX_WARN)}; "
-           f"those companies count as 'not in index'.</p>" if INDEX_WARN else "")
-        + "<p>Index flags and all SEC properties are on the attached workbook.</p>"
+        + "<p>All SEC properties (incl. Is_Fund flag) are on the attached workbook.</p>"
     )
     msg.set_content(plain)
     msg.add_alternative(html, subtype="html")
