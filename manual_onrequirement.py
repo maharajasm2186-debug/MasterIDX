@@ -122,23 +122,36 @@ class RateLimiter:
 limiter = RateLimiter(REQ_PER_SEC)
 
 # =============================================================================
-# FUND COMPANY DETECTION
+# FUND COMPANY DETECTION   (Is_Fund = 1)
 # -----------------------------------------------------------------------------
-# A filer is marked Is_Fund = 1 when its SEC SIC code is a fund-type code OR its
-# name contains a fund keyword.  Both can be overridden in manual_config.ini:
-#   fund_sic_codes  = 6726,6722,6221
-#   fund_name_regex = \b(FUNDS?|ETFS?|ISHARES|SPDR)\b
+# A filer is a fund when ANY of these is true (checked in this order):
+#   1. SEC entity type is "investment"  (registered investment companies)
+#   2. SIC is a pure fund code (default 6726, 6722)
+#   3. Name contains FUND / FUNDS / ETF / COMMODITY POOL
+#   4. Name has a fund sponsor word (iShares, SPDR, ProShares, WisdomTree, VanEck,
+#      Grayscale, Teucrium) AND the word TRUST   -> "WisdomTree, Inc." is NOT a fund
+#   5. SIC is an AMBIGUOUS code (default 6221, commodity brokers) AND the name also
+#      looks like a fund (FUND/ETF/TRUST/POOL/FUTURES/PORTFOLIO/L.P.)
+#      -> an operating "xyz Inc." with SIC 6221 is NOT a fund
+# Overridable in manual_config.ini: fund_sic_codes, fund_sic_codes_need_name,
+# fund_name_regex
 # =============================================================================
-FUND_SICS = {x.strip() for x in section.get("fund_sic_codes", "6726,6722,6221").split(",") if x.strip()}
-FUND_NAME_RX = re.compile(
-    section.get("fund_name_regex",
-                r"\b(FUNDS?|ETFS?|ISHARES|SPDR|PROSHARES|WISDOMTREE|VANECK|GRAYSCALE|COMMODITY POOL)\b"),
-    re.I)
+FUND_SICS = {x.strip() for x in section.get("fund_sic_codes", "6726,6722").split(",") if x.strip()}
+FUND_SICS_NEED_NAME = {x.strip() for x in section.get("fund_sic_codes_need_name", "6221").split(",") if x.strip()}
+FUND_NAME_RX = re.compile(section.get("fund_name_regex", r"\b(FUNDS?|ETFS?|COMMODITY POOL)\b"), re.I)
+FUND_SPONSOR_RX = re.compile(
+    r"\b(ISHARES|SPDR|PROSHARES|WISDOMTREE|VANECK|GRAYSCALE|TEUCRIUM)\b.*\bTRUST\b", re.I)
+FUND_HINT_RX = re.compile(r"\b(FUNDS?|ETFS?|TRUST|POOL|FUTURES|PORTFOLIO)\b|L\.?P\.?$", re.I)
 
 def is_fund(row):
-    sic = str(row.get("SIC") or "").split(".")[0].strip()
-    name = f"{row.get('Company') or ''} {row.get('Company_Name_API') or ''}"
-    return 1 if (sic in FUND_SICS or FUND_NAME_RX.search(name)) else 0
+    sic  = str(row.get("SIC") or "").split(".")[0].strip()
+    name = f"{row.get('Company') or ''} {row.get('Company_Name_API') or ''}".strip()
+    if str(row.get("Entity_Type") or "").strip().lower() == "investment": return 1
+    if sic in FUND_SICS: return 1
+    if FUND_NAME_RX.search(name): return 1
+    if FUND_SPONSOR_RX.search(name): return 1
+    if sic in FUND_SICS_NEED_NAME and FUND_HINT_RX.search(name): return 1
+    return 0
 
 # =============================================================================
 # EDGAR INDEX
