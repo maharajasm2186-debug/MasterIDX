@@ -66,8 +66,7 @@ print(f"Date period: {start} → {end}   ({len(all_dates)} calendar days)")
 
 # ---------- Recipients ----------
 RECIPIENTS = [r.strip() for r in section.get("recipients", "").split(",") if r.strip()] or [
-    "auditfeeteam@gmail.com", "santhakumarcu@gmail.com",
-    "maharaja@secanalyzer.net", "chandru@secanalyzer.net",
+    "maharaja@secanalyzer.net",
 ]
 
 # =============================================================================
