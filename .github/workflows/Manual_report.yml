@@ -1,0 +1,24 @@
+name: Manual SEC Filing Report
+on:
+  workflow_dispatch:          # run from the Actions tab; edit manual_config.ini first
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install pandas requests openpyxl holidays lxml beautifulsoup4 html5lib
+      - name: Run report
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
+        run: python manual_onrequirement.py
+      - name: Keep report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec-report
+          path: manual_report_*.xlsx
