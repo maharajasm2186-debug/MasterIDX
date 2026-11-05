@@ -179,7 +179,20 @@ def fetch_idx_for_date(d):
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code == 200 and "|" in r.text:
                 dfd = _parse_idx(r.text)
-                dfd = dfd[dfd["Date_Filed"] == ds]
+                if label == "Daily":
+                    # The daily index file master{nod}.idx already contains
+                    # ONLY filings released on the requested date, so we must
+                    # NOT re-filter by Date_Filed. Some filings in the daily
+                    # index have Date_Filed from the prior day (accepted late
+                    # but released next day) — filtering them out loses real
+                    # same-day releases (e.g. IB Acquisition Corp's DEF 14A
+                    # was accepted 2026-11-03 but released in the 2026-11-04
+                    # daily index).
+                    pass
+                else:
+                    # The quarterly master.idx contains the ENTIRE quarter,
+                    # so we DO need to filter to the requested date here.
+                    dfd = dfd[dfd["Date_Filed"] == ds]
                 frames.append(dfd)
                 print(f"  ✓ {label} IDX → {len(dfd)} filings")
         except Exception as e:
