@@ -6,6 +6,7 @@ from pathlib import Path
 import configparser, time, threading
 from concurrent.futures import ThreadPoolExecutor
 import holidays as us_holidays
+from zoneinfo import ZoneInfo
 
 # =============================================================================
 # MANUAL SEC FILING REPORT  (branch version — NOT scheduled)
@@ -63,6 +64,18 @@ if end < start:
 
 all_dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
 print(f"Date period: {start} → {end}   ({len(all_dates)} calendar days)")
+
+# ---------- Accepted-date check (NEW) ----------
+# check_accepted_diff = yes  → also pull the previous / next trading-day IDX, enrich
+#   those filings, and list every filing whose ACCEPTANCE date is inside the period
+#   but whose Date_Filed differs (sheet 'Accepted_vs_Filed_Diff').
+# accept_date_basis   = UTC | ET   → which calendar day acceptanceDateTime is judged on.
+#   SEC API stores acceptanceDateTime in UTC (what you see in the Acceptance_DateTime
+#   column), so UTC is the default. Use ET for the EDGAR (New York) calendar day.
+CHECK_ACCEPTED = section.get("check_accepted_diff", "yes").strip().lower() in ("yes", "true", "1", "y")
+ACCEPT_BASIS   = section.get("accept_date_basis", "UTC").strip().upper()
+if ACCEPT_BASIS not in ("UTC", "ET"): ACCEPT_BASIS = "UTC"
+print(f"check_accepted_diff = {CHECK_ACCEPTED} | accept_date_basis = {ACCEPT_BASIS}")
 
 # ---------- Recipients ----------
 RECIPIENTS = [r.strip() for r in section.get("recipients", "").split(",") if r.strip()] or [
@@ -179,20 +192,7 @@ def fetch_idx_for_date(d):
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code == 200 and "|" in r.text:
                 dfd = _parse_idx(r.text)
-                if label == "Daily":
-                    # The daily index file master{nod}.idx already contains
-                    # ONLY filings released on the requested date, so we must
-                    # NOT re-filter by Date_Filed. Some filings in the daily
-                    # index have Date_Filed from the prior day (accepted late
-                    # but released next day) — filtering them out loses real
-                    # same-day releases (e.g. IB Acquisition Corp's DEF 14A
-                    # was accepted 2026-11-03 but released in the 2026-11-04
-                    # daily index).
-                    pass
-                else:
-                    # The quarterly master.idx contains the ENTIRE quarter,
-                    # so we DO need to filter to the requested date here.
-                    dfd = dfd[dfd["Date_Filed"] == ds]
+                dfd = dfd[dfd["Date_Filed"] == ds]
                 frames.append(dfd)
                 print(f"  ✓ {label} IDX → {len(dfd)} filings")
         except Exception as e:
@@ -207,13 +207,32 @@ def matches(ft):
     if FORM_PREFIXES is None: return True
     return any(str(ft).upper().startswith(p) for p in FORM_PREFIXES)
 
+def prev_trading_day(d):
+    d -= timedelta(days=1)
+    while non_trading_reason(d): d -= timedelta(days=1)
+    return d
+
+def next_trading_day(d):
+    d += timedelta(days=1)
+    while non_trading_reason(d): d += timedelta(days=1)
+    return d
+
 # =============================================================================
-# LOOP OVER DATE RANGE
+# LOOP OVER DATE RANGE  (+ one trading day before / after, to catch filings whose
+# Date_Filed is outside the period but whose acceptance date is inside it)
 # =============================================================================
+buffer_dates = []
+if CHECK_ACCEPTED:
+    buffer_dates.append(prev_trading_day(start))
+    nxt = next_trading_day(end)
+    if nxt <= date.today(): buffer_dates.append(nxt)
+    print(f"Buffer IDX dates for accepted-date check: {[b.isoformat() for b in buffer_dates]}")
+
 all_frames, skipped, empty_days = [], [], []
-idx_totals = {}          # IDX date → total filings released that day (ALL forms)
-for d in all_dates:
+idx_totals = {}          # IDX date → total filings released that day (ALL forms, in-period only)
+for d in sorted(set(all_dates) | set(buffer_dates)):
     ds = d.strftime("%Y-%m-%d")
+    in_period = start <= d <= end
     reason = non_trading_reason(d)
     if reason:
         print(f"\n[{ds}] SKIP — {reason}")
@@ -222,9 +241,11 @@ for d in all_dates:
     print(f"\n[{ds}] Fetching EDGAR index ...")
     df_day = fetch_idx_for_date(d)
     if df_day.empty:
-        print("  No index entries."); empty_days.append(ds); continue
+        print("  No index entries.")
+        if in_period: empty_days.append(ds)
+        continue
 
-    idx_totals[ds] = len(df_day)
+    if in_period: idx_totals[ds] = len(df_day)
     df_filt = df_day[df_day["Form_Type"].apply(matches)].copy()
     print(f"  → {len(df_filt)} filings match form filter")
     if not df_filt.empty: all_frames.append(df_filt)
@@ -329,10 +350,19 @@ df_full["Item_5_07"] = df_full["Items"].apply(lambda x: _has_item(x, "5.07"))
 df_full["Is_Fund"] = df_full.apply(is_fund, axis=1)
 df_full["Industry"] = df_full["Industry"].fillna("Unknown")
 
+# ---------- Acceptance date (UTC and ET) + filed-vs-accepted flag ----------
+_acc = pd.to_datetime(df_full["Acceptance_DateTime"], utc=True, errors="coerce")
+_acc_et = _acc.dt.tz_convert("America/New_York")
+df_full["Accepted_UTC"] = _acc.dt.strftime("%Y-%m-%d %H:%M:%S")
+df_full["Accepted_ET"]  = _acc_et.dt.strftime("%Y-%m-%d %H:%M:%S")
+df_full["Accepted_Date"] = (_acc_et if ACCEPT_BASIS == "ET" else _acc).dt.strftime("%Y-%m-%d")
+df_full["Filed_vs_Accepted_Diff"] = ((df_full["Accepted_Date"].notna()) &
+                                     (df_full["Accepted_Date"] != df_full["Date_Filed"])).astype(int)
+
 ORDER = [
     "Date_Filed","CIK","Company","Company_Name_API","Tickers",
     "Form_Type","Form_Group","Is_Fund","Report_Date",
-    "Accession_No","Filing_URL","Acceptance_DateTime","Act","File_Number",
+    "Accession_No","Filing_URL","Acceptance_DateTime","Accepted_UTC","Accepted_ET","Accepted_Date","Filed_vs_Accepted_Diff","Act","File_Number",
     "Film_Number","Size","Is_XBRL","Is_Inline_XBRL","Primary_Document",
     "Primary_Doc_Description","Items","Item_5_02","Item_4_01","Item_5_07",
     "SIC","Industry","State_of_Incorporation","State_of_Incorporation_Desc",
@@ -344,6 +374,19 @@ ORDER = [
 for c in ORDER:
     if c not in df_full.columns: df_full[c] = None
 df_full = df_full[ORDER]
+
+# ---------- Split: main report (Date_Filed in period) vs accepted-date diff ----------
+_ps, _pe = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+_filed_in = df_full["Date_Filed"].between(_ps, _pe)
+_acc_in   = df_full["Accepted_Date"].between(_ps, _pe)
+df_diff = df_full[_acc_in & (df_full["Filed_vs_Accepted_Diff"] == 1)].copy()
+df_diff.insert(0, "Missed_By_Date_Filed", (~df_diff["Date_Filed"].between(_ps, _pe)).astype(int))
+df_diff = df_diff.sort_values(["Accepted_Date", "Date_Filed", "Form_Group", "CIK"]).reset_index(drop=True)
+df_full = df_full[_filed_in].reset_index(drop=True)      # main sheets stay Date_Filed based
+print(f"Filed in period: {len(df_full)} | Accepted in period but Date_Filed differs: {len(df_diff)} "
+      f"(of which not in Date_Filed period: {int(df_diff['Missed_By_Date_Filed'].sum())})")
+if df_full.empty:
+    print("No filings with Date_Filed inside the period — main tables will be empty.")
 
 # =============================================================================
 # SUMMARY TABLE  (one row per IDX date × form group, then TOTAL row)
@@ -415,16 +458,32 @@ def build_date_table(df):
     out.loc[len(out)] = ["TOTAL"] + [int(out[c].sum()) for c in T2_COLS[1:]]
     return out
 
+def build_diff_table(df):
+    cols = ["Accepted Date", "Date Filed", "Form Group", "Companies", "Filings"]
+    if df.empty: return pd.DataFrame(columns=cols)
+    g = (df.groupby(["Accepted_Date", "Date_Filed", "Form_Group"])
+           .agg(Companies=("CIK", "nunique"), Filings=("Accession_No", "nunique"))
+           .reset_index())
+    g["_k"] = g["Form_Group"].apply(_gkey)
+    g = g.sort_values(["Accepted_Date", "Date_Filed", "_k"]).drop(columns="_k")
+    g.columns = cols
+    g.loc[len(g)] = ["TOTAL", "", "", int(g["Companies"].sum()), int(g["Filings"].sum())]
+    return g
+
+table_diff = build_diff_table(df_diff)
 table_formgroup = build_formgroup_table(df_full, PERIOD_DESC)
 table_datewise  = build_date_table(df_full)
 
-industry_breakdown = (
-    df_full.groupby(["Date_Filed", "Form_Group", "Industry"])
-    .agg(Companies=("CIK", "nunique"),
-         Fund_Companies=("Is_Fund", lambda s: df_full.loc[s.index][s == 1]["CIK"].nunique()))
-    .reset_index()
-    .sort_values(["Date_Filed", "Form_Group", "Companies"], ascending=[True, True, False])
-)
+if df_full.empty:
+    industry_breakdown = pd.DataFrame(columns=["Date_Filed","Form_Group","Industry","Companies","Fund_Companies"])
+else:
+    industry_breakdown = (
+        df_full.groupby(["Date_Filed", "Form_Group", "Industry"])
+        .agg(Companies=("CIK", "nunique"),
+             Fund_Companies=("Is_Fund", lambda s: df_full.loc[s.index][s == 1]["CIK"].nunique()))
+        .reset_index()
+        .sort_values(["Date_Filed", "Form_Group", "Companies"], ascending=[True, True, False])
+    )
 
 # =============================================================================
 # EXPORT
@@ -441,6 +500,8 @@ with pd.ExcelWriter(OUTPUT_FILE) as w:
     summary.to_excel(w, sheet_name="Summary", index=False)
     industry_breakdown.to_excel(w, sheet_name="Industry_Breakdown", index=False)
     df_full.to_excel(w, sheet_name="All_Properties", index=False)
+    table_diff.to_excel(w, sheet_name="Accepted_vs_Filed_Summary", index=False)
+    df_diff.to_excel(w, sheet_name="Accepted_vs_Filed_Diff", index=False)
     for ws in w.book.worksheets:
         ws.freeze_panes = "A2"
         for col in ws.columns:
@@ -512,10 +573,12 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"Filings in report : {n_matched}\n\n"
         f"Table 1 — Form Group (IDX range {period_desc})\n{table_formgroup.to_string(index=False)}\n\n"
         f"Table 2 — Date wise\n{table_datewise.to_string(index=False)}\n\n"
+        f"Table 3 — Accepted in period but Date Filed differs\n{table_diff.to_string(index=False)}\n\n"
         f"{group_note}\n\n"
         f"8-K items flagged:  5.02: {n502} | 4.01: {n401} | 5.07: {n507}\n"
         f"{skipped_txt}{empty_txt}\n"
-        f"All SEC properties (incl. Is_Fund flag) are in the attached workbook."
+        f"All SEC properties (incl. Is_Fund flag) are in the attached workbook "
+        f"(sheet 'Accepted_vs_Filed_Diff' lists the accepted-vs-filed differences)."
     )
     html = (
         f"<p><b>Manual SEC filing report</b><br>"
@@ -525,6 +588,8 @@ def send_report(path, recipients, ps, pe, form_prefixes,
         f"{summary_html(table_formgroup, left=2)}"
         f"<p><b>Table 2 — Date wise</b></p>"
         f"{summary_html(table_datewise, left=1)}"
+        f"<p><b>Table 3 — Accepted in period ({ACCEPT_BASIS} date) but Date Filed differs</b></p>"
+        f"{summary_html(table_diff, left=3) if not table_diff.empty else '<p>None found.</p>'}"
         f"<p style='font-size:12px;color:#555'>{group_note}<br>"
         f"The detailed date × form group table is on the 'Summary' sheet. "
         f"Counts are unique companies (CIK). 'Industries' = distinct SIC industries. "
