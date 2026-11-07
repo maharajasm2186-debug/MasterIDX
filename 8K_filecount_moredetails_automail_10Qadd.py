@@ -400,8 +400,11 @@ df_full["Industry"] = df_full["Industry"].fillna("Unknown")
 for col, code in [("Item_5_02","5.02"), ("Item_4_01","4.01"), ("Item_5_07","5.07")]:
     df_full[col] = pd.to_numeric(df_full[col], errors="coerce").fillna(0).astype(int)
     if "Items" in df_full.columns:
+ # FIXED: Pre-build the regex pattern to avoid a backslash inside the f-string
+        pattern = r"\b" + re.escape(code) + r"\b"
+        
         api_hit = (df_full["Items"].fillna("").astype(str)
-                     .str.contains(rf"\b{code.replace('.', r'\.')}\b", regex=True)
+                     .str.contains(pattern, regex=True)
                      .astype(int))
         mismatch = int(((df_full[col] == 0) & (api_hit == 1)).sum())
         if mismatch:
