@@ -15,8 +15,6 @@ import holidays as us_holidays
 # =============================================================================
 # DAILY AUTOMATION + EMAIL  (format aligned with manual_onrequirement.py)
 # =============================================================================
-#  ...  (header comment unchanged from original)  ...
-# =============================================================================
 
 DAYS_BACK = 1
 
@@ -400,7 +398,7 @@ df_full["Industry"] = df_full["Industry"].fillna("Unknown")
 for col, code in [("Item_5_02","5.02"), ("Item_4_01","4.01"), ("Item_5_07","5.07")]:
     df_full[col] = pd.to_numeric(df_full[col], errors="coerce").fillna(0).astype(int)
     if "Items" in df_full.columns:
- # FIXED: Pre-build the regex pattern to avoid a backslash inside the f-string
+        # FIXED: Pre-build the regex pattern to avoid a backslash inside the f-string
         pattern = r"\b" + re.escape(code) + r"\b"
         
         api_hit = (df_full["Items"].fillna("").astype(str)
@@ -463,16 +461,6 @@ ITEM_FLAGS = [("Item 5.02", "Item_5_02"),
               ("Item 4.01", "Item_4_01")]
 
 def build_formgroup_table(df, period):
-    """
-    One row per form group. 8-K is broken into item sub-rows.
-
-    'Filings'            = row count  in  df  for that group
-    'Companies Released' = df[group].CIK.nunique()
-    'Fund Companies'     = unique CIK with Is_Fund == 1
-    'Industries'         = df[group].Industry.nunique()
-
-    -> Every number here is recomputable by filtering the All_Properties sheet.
-    """
     rows, base = [], []
     for fg in sorted(df["Form_Group"].unique(), key=_gkey):
         h = df[df["Form_Group"] == fg]
