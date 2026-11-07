@@ -26,6 +26,10 @@ else:
 dt = datetime.strptime(input_date, "%Y-%m-%d")
 
 RECIPIENTS = ["maharaja@secanalyzer.net"]
+RECIPIENTS = ["lawrenceamal@gmail.com"]
+RECIPIENTS = ["auditfeeteam@gmail.com"]
+RECIPIENTS = ["chandru@secanalyzer.net"]
+RECIPIENTS = ["santhakumarcu@gmail.com"]
 
 # =============================================================================
 # WEEKEND / SEC HOLIDAY GUARD
